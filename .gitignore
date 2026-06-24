@@ -1,0 +1,6 @@
+/target/
+/data/
+*.log
+.agents/
+AGENTS.md
+skills-lock.json
