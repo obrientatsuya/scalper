@@ -1,4 +1,7 @@
-use crate::events::{DepthDeltaEvent, Exchange, MarketEvent, TickerEvent, TradeEvent};
+use crate::events::{
+    DepthDeltaEvent, Exchange, KlineEvent, MarketEvent, OptionGreekEvent, OrderBookSnapshotEvent,
+    TickerEvent, TradeEvent,
+};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Utc;
@@ -162,11 +165,8 @@ pub fn spawn_parquet_replay(
 pub fn read_events_from_parquet(path: impl AsRef<Path>) -> anyhow::Result<Vec<MarketEvent>> {
     let path = path.as_ref();
     let mut events = if path.is_dir() {
-        let mut files = fs::read_dir(path)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
-            .collect::<Vec<_>>();
+        let mut files = Vec::new();
+        collect_parquet_files(path, &mut files)?;
         files.sort();
 
         let mut events = Vec::new();
@@ -180,6 +180,48 @@ pub fn read_events_from_parquet(path: impl AsRef<Path>) -> anyhow::Result<Vec<Ma
 
     events.sort_by_key(event_ts_local_ms);
     Ok(events)
+}
+
+pub fn write_events_to_parquet_run(
+    root_dir: impl AsRef<Path>,
+    symbol: &str,
+    run_name: &str,
+    events: impl IntoIterator<Item = MarketEvent>,
+    flush_batch_size: usize,
+) -> anyhow::Result<PathBuf> {
+    let run_dir = root_dir
+        .as_ref()
+        .join(symbol.to_ascii_lowercase())
+        .join(run_name);
+    let config = StorageConfig {
+        enabled: true,
+        root_dir: root_dir.as_ref().to_path_buf(),
+        symbol: symbol.to_string(),
+        flush_batch_size,
+        flush_interval: Duration::from_secs(1),
+    };
+    let mut writer = ParquetEventWriter::new_at(config, run_dir.clone())?;
+    for event in events {
+        writer.push(event)?;
+        if writer.buffered_events() >= flush_batch_size {
+            writer.flush()?;
+        }
+    }
+    writer.flush()?;
+    writer.close()?;
+    Ok(run_dir)
+}
+
+fn collect_parquet_files(path: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_parquet_files(&path, files)?;
+        } else if path.extension().is_some_and(|ext| ext == "parquet") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn read_events_from_parquet_file(path: &Path) -> anyhow::Result<Vec<MarketEvent>> {
@@ -223,6 +265,10 @@ struct ParquetEventWriter {
 impl ParquetEventWriter {
     fn new(config: &StorageConfig) -> anyhow::Result<Self> {
         let run_dir = run_dir(&config.root_dir, &config.symbol);
+        Self::new_at(config.clone(), run_dir)
+    }
+
+    fn new_at(config: StorageConfig, run_dir: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&run_dir)?;
 
         let schema = Arc::new(storage_schema());
@@ -381,7 +427,10 @@ fn event_ts_local_ms(event: &MarketEvent) -> i64 {
     match event {
         MarketEvent::Trade(TradeEvent { ts_local_ms, .. })
         | MarketEvent::DepthDelta(DepthDeltaEvent { ts_local_ms, .. })
+        | MarketEvent::OrderBookSnapshot(OrderBookSnapshotEvent { ts_local_ms, .. })
         | MarketEvent::Ticker(TickerEvent { ts_local_ms, .. })
+        | MarketEvent::Kline(KlineEvent { ts_local_ms, .. })
+        | MarketEvent::OptionGreek(OptionGreekEvent { ts_local_ms, .. })
         | MarketEvent::Heartbeat { ts_local_ms, .. } => *ts_local_ms,
     }
 }
@@ -391,6 +440,9 @@ fn event_ts_exchange_ms(event: &MarketEvent) -> Option<i64> {
         MarketEvent::Trade(TradeEvent { ts_exchange_ms, .. })
         | MarketEvent::DepthDelta(DepthDeltaEvent { ts_exchange_ms, .. })
         | MarketEvent::Ticker(TickerEvent { ts_exchange_ms, .. }) => Some(*ts_exchange_ms),
+        MarketEvent::Kline(KlineEvent { open_time_ms, .. }) => Some(*open_time_ms),
+        MarketEvent::OptionGreek(_) => None,
+        MarketEvent::OrderBookSnapshot(_) => None,
         MarketEvent::Heartbeat { .. } => None,
     }
 }
@@ -399,7 +451,12 @@ fn event_exchange(event: &MarketEvent) -> String {
     match event {
         MarketEvent::Trade(TradeEvent { exchange, .. })
         | MarketEvent::DepthDelta(DepthDeltaEvent { exchange, .. })
-        | MarketEvent::Ticker(TickerEvent { exchange, .. }) => exchange_name(*exchange).to_string(),
+        | MarketEvent::OrderBookSnapshot(OrderBookSnapshotEvent { exchange, .. })
+        | MarketEvent::Ticker(TickerEvent { exchange, .. })
+        | MarketEvent::Kline(KlineEvent { exchange, .. })
+        | MarketEvent::OptionGreek(OptionGreekEvent { exchange, .. }) => {
+            exchange_name(*exchange).to_string()
+        }
         MarketEvent::Heartbeat { .. } => "internal".to_string(),
     }
 }
@@ -408,7 +465,10 @@ fn event_symbol(event: &MarketEvent) -> String {
     match event {
         MarketEvent::Trade(TradeEvent { symbol, .. })
         | MarketEvent::DepthDelta(DepthDeltaEvent { symbol, .. })
-        | MarketEvent::Ticker(TickerEvent { symbol, .. }) => symbol.clone(),
+        | MarketEvent::OrderBookSnapshot(OrderBookSnapshotEvent { symbol, .. })
+        | MarketEvent::Ticker(TickerEvent { symbol, .. })
+        | MarketEvent::Kline(KlineEvent { symbol, .. }) => symbol.clone(),
+        MarketEvent::OptionGreek(OptionGreekEvent { underlying, .. }) => underlying.clone(),
         MarketEvent::Heartbeat { .. } => String::new(),
     }
 }
@@ -417,7 +477,10 @@ fn event_kind(event: &MarketEvent) -> &'static str {
     match event {
         MarketEvent::Trade(_) => "trade",
         MarketEvent::DepthDelta(_) => "depth_delta",
+        MarketEvent::OrderBookSnapshot(_) => "orderbook_snapshot",
         MarketEvent::Ticker(_) => "ticker",
+        MarketEvent::Kline(_) => "kline",
+        MarketEvent::OptionGreek(_) => "option_greek",
         MarketEvent::Heartbeat { .. } => "heartbeat",
     }
 }
@@ -523,6 +586,45 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], MarketEvent::Trade(_)));
         assert!(matches!(events[1], MarketEvent::Heartbeat { .. }));
+        let recursive_events = read_events_from_parquet(&root).expect("read nested events");
+        assert_eq!(recursive_events.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writes_events_to_named_parquet_run() {
+        let root = std::env::temp_dir().join(format!(
+            "scalper-storage-named-run-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let run_dir = write_events_to_parquet_run(
+            &root,
+            "BTCUSDT",
+            "run-test",
+            vec![MarketEvent::Kline(KlineEvent {
+                exchange: Exchange::Binance,
+                symbol: "BTCUSDT".to_string(),
+                interval: "1m".to_string(),
+                open_time_ms: 1,
+                close_time_ms: 60_000,
+                ts_local_ms: 60_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 10.0,
+                quote_volume: 1_005.0,
+                trades: 3,
+            })],
+            10,
+        )
+        .expect("write named run");
+
+        let events = read_events_from_parquet(&run_dir).expect("read named run");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MarketEvent::Kline(_)));
 
         let _ = fs::remove_dir_all(root);
     }

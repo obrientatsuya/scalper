@@ -1,4 +1,4 @@
-use crate::events::{DepthDeltaEvent, DepthLevel, Exchange, MarketEvent};
+use crate::events::{DepthDeltaEvent, DepthLevel, Exchange, MarketEvent, OrderBookSnapshotEvent};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -25,14 +25,7 @@ impl Ord for PriceKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderBookSnapshot {
-    pub exchange: Exchange,
-    pub symbol: String,
-    pub last_update_id: u64,
-    pub bids: Vec<DepthLevel>,
-    pub asks: Vec<DepthLevel>,
-}
+pub type OrderBookSnapshot = OrderBookSnapshotEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookStats {
@@ -73,10 +66,13 @@ pub fn spawn_orderbook_engine(
     symbol: String,
     mut market_rx: mpsc::Receiver<MarketEvent>,
     stats_tx: watch::Sender<OrderBookStats>,
+    snapshot_tx: Option<mpsc::Sender<MarketEvent>>,
+    fetch_snapshots: bool,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut engine = LocalOrderBook::new(Exchange::Binance, symbol);
+        let mut engine =
+            LocalOrderBook::new(Exchange::Binance, symbol, snapshot_tx, fetch_snapshots);
 
         loop {
             tokio::select! {
@@ -86,17 +82,22 @@ pub fn spawn_orderbook_engine(
                         return;
                     };
 
-                    if let MarketEvent::DepthDelta(delta) = event
-                        && delta.exchange == Exchange::Binance
-                    {
-                        match engine.on_depth_delta(delta).await {
-                            Ok(()) => {
-                                let _ = stats_tx.send(engine.stats());
-                            }
-                            Err(error) => {
-                                warn!(%error, "orderbook delta failed");
+                    match event {
+                        MarketEvent::DepthDelta(delta) if delta.exchange == Exchange::Binance => {
+                            match engine.on_depth_delta(delta).await {
+                                Ok(()) => {
+                                    let _ = stats_tx.send(engine.stats());
+                                }
+                                Err(error) => {
+                                    warn!(%error, "orderbook delta failed");
+                                }
                             }
                         }
+                        MarketEvent::OrderBookSnapshot(snapshot) if snapshot.exchange == Exchange::Binance => {
+                            engine.on_snapshot(snapshot);
+                            let _ = stats_tx.send(engine.stats());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -119,10 +120,17 @@ pub struct LocalOrderBook {
     resyncs: u64,
     gaps: u64,
     http: reqwest::Client,
+    snapshot_tx: Option<mpsc::Sender<MarketEvent>>,
+    fetch_snapshots: bool,
 }
 
 impl LocalOrderBook {
-    pub fn new(exchange: Exchange, symbol: String) -> Self {
+    pub fn new(
+        exchange: Exchange,
+        symbol: String,
+        snapshot_tx: Option<mpsc::Sender<MarketEvent>>,
+        fetch_snapshots: bool,
+    ) -> Self {
         Self {
             exchange,
             symbol,
@@ -137,13 +145,15 @@ impl LocalOrderBook {
             resyncs: 0,
             gaps: 0,
             http: reqwest::Client::new(),
+            snapshot_tx,
+            fetch_snapshots,
         }
     }
 
     pub async fn on_depth_delta(&mut self, delta: DepthDeltaEvent) -> anyhow::Result<()> {
         if !self.synced {
             self.pending.push_back(delta);
-            if !self.snapshot_in_flight {
+            if self.fetch_snapshots && !self.snapshot_in_flight {
                 self.sync_from_snapshot().await?;
             }
             return Ok(());
@@ -151,10 +161,17 @@ impl LocalOrderBook {
 
         if !self.apply_synced_delta(delta) {
             self.mark_desynced();
-            self.sync_from_snapshot().await?;
+            if self.fetch_snapshots {
+                self.sync_from_snapshot().await?;
+            }
         }
 
         Ok(())
+    }
+
+    pub fn on_snapshot(&mut self, snapshot: OrderBookSnapshot) {
+        self.apply_snapshot(snapshot);
+        self.replay_pending();
     }
 
     pub fn apply_snapshot(&mut self, snapshot: OrderBookSnapshot) {
@@ -298,6 +315,11 @@ impl LocalOrderBook {
         self.snapshot_in_flight = true;
         let snapshot = fetch_binance_snapshot(&self.http, &self.symbol).await?;
         self.snapshot_in_flight = false;
+        if let Some(snapshot_tx) = &self.snapshot_tx {
+            let _ = snapshot_tx
+                .send(MarketEvent::OrderBookSnapshot(snapshot.clone()))
+                .await;
+        }
         self.apply_snapshot(snapshot);
         self.replay_pending();
         Ok(())
@@ -364,10 +386,20 @@ async fn fetch_binance_snapshot(
     Ok(OrderBookSnapshot {
         exchange: Exchange::Binance,
         symbol: symbol.to_string(),
+        ts_local_ms: now_ms(),
         last_update_id: response.last_update_id,
         bids: parse_snapshot_levels(response.bids)?,
         asks: parse_snapshot_levels(response.asks)?,
     })
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn parse_snapshot_levels(levels: Vec<[String; 2]>) -> anyhow::Result<Vec<DepthLevel>> {
@@ -437,10 +469,13 @@ mod tests {
 
     #[test]
     fn applies_synced_delta_when_previous_matches() {
-        let mut book = LocalOrderBook::new(Exchange::Binance, "BTCUSDT".to_string());
+        let (tx, _rx) = mpsc::channel(1);
+        let mut book =
+            LocalOrderBook::new(Exchange::Binance, "BTCUSDT".to_string(), Some(tx), true);
         book.apply_snapshot(OrderBookSnapshot {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
+            ts_local_ms: 1,
             last_update_id: 100,
             bids: vec![DepthLevel {
                 price: 99.0,
@@ -460,10 +495,13 @@ mod tests {
 
     #[test]
     fn rejects_gap() {
-        let mut book = LocalOrderBook::new(Exchange::Binance, "BTCUSDT".to_string());
+        let (tx, _rx) = mpsc::channel(1);
+        let mut book =
+            LocalOrderBook::new(Exchange::Binance, "BTCUSDT".to_string(), Some(tx), true);
         book.apply_snapshot(OrderBookSnapshot {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
+            ts_local_ms: 1,
             last_update_id: 100,
             bids: vec![],
             asks: vec![],

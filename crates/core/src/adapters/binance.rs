@@ -10,7 +10,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-const BINANCE_USD_M_WS_BASE: &str = "wss://fstream.binance.com/stream?streams=";
+const BINANCE_USD_M_PUBLIC_WS_BASE: &str = "wss://fstream.binance.com/public/stream?streams=";
+const BINANCE_USD_M_MARKET_WS_BASE: &str = "wss://fstream.binance.com/market/stream?streams=";
 
 pub fn spawn_binance_market_data(
     symbol: String,
@@ -18,52 +19,81 @@ pub fn spawn_binance_market_data(
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(1);
+        let public = run_reconnecting_stream(
+            binance_public_stream_url(&symbol),
+            market_tx.clone(),
+            shutdown.child_token(),
+            "binance public stream",
+        );
+        let market = run_reconnecting_stream(
+            binance_market_stream_url(&symbol),
+            market_tx,
+            shutdown.child_token(),
+            "binance market stream",
+        );
 
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-
-            let url = combined_stream_url(&symbol);
-            info!(%url, "connecting binance market data");
-
-            let result = run_binance_stream(&url, market_tx.clone(), shutdown.clone()).await;
-
-            if shutdown.is_cancelled() {
-                return;
-            }
-
-            match result {
-                Ok(()) => {
-                    warn!("binance stream ended");
-                    backoff = Duration::from_secs(1);
-                }
-                Err(error) => {
-                    warn!(%error, ?backoff, "binance stream failed");
-                }
-            }
-
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = sleep(backoff) => {}
-            }
-
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = public => {}
+            _ = market => {}
         }
     })
 }
 
-fn combined_stream_url(symbol: &str) -> String {
+async fn run_reconnecting_stream(
+    url: String,
+    market_tx: mpsc::Sender<MarketEvent>,
+    shutdown: CancellationToken,
+    label: &'static str,
+) {
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        info!(%url, label, "connecting binance market data");
+
+        let result = run_binance_stream(&url, market_tx.clone(), shutdown.clone()).await;
+
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        match result {
+            Ok(()) => {
+                warn!(label, "binance stream ended");
+                backoff = Duration::from_secs(1);
+            }
+            Err(error) => {
+                warn!(%error, ?backoff, label, "binance stream failed");
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = sleep(backoff) => {}
+        }
+
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+fn binance_public_stream_url(symbol: &str) -> String {
     let symbol = symbol.to_ascii_lowercase();
     let streams = [
-        format!("{symbol}@aggTrade"),
         format!("{symbol}@bookTicker"),
         format!("{symbol}@depth@100ms"),
     ]
     .join("/");
 
-    format!("{BINANCE_USD_M_WS_BASE}{streams}")
+    format!("{BINANCE_USD_M_PUBLIC_WS_BASE}{streams}")
+}
+
+fn binance_market_stream_url(symbol: &str) -> String {
+    let symbol = symbol.to_ascii_lowercase();
+    format!("{BINANCE_USD_M_MARKET_WS_BASE}{symbol}@aggTrade")
 }
 
 async fn run_binance_stream(
@@ -310,5 +340,17 @@ mod tests {
 
         assert_eq!(ticker.bid, 64000.0);
         assert_eq!(ticker.ask, 64000.10);
+    }
+
+    #[test]
+    fn routes_trade_stream_to_market_endpoint() {
+        assert_eq!(
+            binance_market_stream_url("BTCUSDT"),
+            "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade"
+        );
+        assert_eq!(
+            binance_public_stream_url("BTCUSDT"),
+            "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/btcusdt@depth@100ms"
+        );
     }
 }
