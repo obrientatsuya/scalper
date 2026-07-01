@@ -12,8 +12,8 @@ type MonitorStateRow = {
   metadata: Record<string, unknown>;
 };
 
-const SUPABASE_URL = mustEnv("SUPABASE_URL");
-const SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? mustEnv("PROJECT_URL");
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? mustEnv("SERVICE_ROLE_KEY");
 const TELEGRAM_BOT_TOKEN = mustEnv("TELEGRAM_BOT_TOKEN");
 const TELEGRAM_CHAT_ID = mustEnv("TELEGRAM_CHAT_ID");
 
@@ -27,33 +27,40 @@ const TEMP_CRITICAL_C = numberEnv("TEMP_CRITICAL_C", 80);
 const NO_EVENTS_SECONDS = numberEnv("NO_EVENTS_SECONDS", 300);
 
 Deno.serve(async (request) => {
-  if (MONITOR_SECRET && request.headers.get("x-monitor-secret") !== MONITOR_SECRET) {
-    return json({ ok: false, error: "unauthorized" }, 401);
+  try {
+    if (MONITOR_SECRET && request.headers.get("x-monitor-secret") !== MONITOR_SECRET) {
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
+
+    const now = new Date();
+    const previous = await readMonitorState();
+    const heartbeat = await readHeartbeat();
+    const evaluation = evaluate(heartbeat, previous, now);
+
+    const shouldNotify =
+      !previous ||
+      previous.state !== evaluation.state ||
+      previous.reason_key !== evaluation.reasonKey;
+
+    if (shouldNotify) {
+      await sendTelegram(formatMessage(evaluation, heartbeat, now));
+    }
+
+    await writeMonitorState(evaluation, previous, now, shouldNotify);
+
+    return json({
+      ok: true,
+      state: evaluation.state,
+      reason: evaluation.reason,
+      reason_key: evaluation.reasonKey,
+      notified: shouldNotify,
+    });
+  } catch (error) {
+    return json({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }, 500);
   }
-
-  const now = new Date();
-  const previous = await readMonitorState();
-  const heartbeat = await readHeartbeat();
-  const evaluation = evaluate(heartbeat, previous, now);
-
-  const shouldNotify =
-    !previous ||
-    previous.state !== evaluation.state ||
-    previous.reason_key !== evaluation.reasonKey;
-
-  if (shouldNotify) {
-    await sendTelegram(formatMessage(evaluation, heartbeat, now));
-  }
-
-  await writeMonitorState(evaluation, previous, now, shouldNotify);
-
-  return json({
-    ok: true,
-    state: evaluation.state,
-    reason: evaluation.reason,
-    reason_key: evaluation.reasonKey,
-    notified: shouldNotify,
-  });
 });
 
 function mustEnv(name: string): string {
@@ -268,7 +275,9 @@ async function rest<T = unknown>(path: string, init: RequestInit = {}): Promise<
   }
 
   if (response.status === 204) return undefined as T;
-  return await response.json() as T;
+  const text = await response.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 function json(body: unknown, status = 200): Response {

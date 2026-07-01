@@ -4,6 +4,7 @@
 .env
 .env.*
 supabase/functions/.env*
+supabase/.temp/
 .agents/
 AGENTS.md
 skills-lock.json
