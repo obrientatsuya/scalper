@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+
+name="scalper"
+description="Rust crypto futures scalper"
+command="/srv/scalper/target/release/scalper"
+command_args="--config /srv/scalper/config/scalper.toml"
+command_user="codex:codex"
+directory="/srv/scalper/current"
+command_background="yes"
+pidfile="/run/scalper.pid"
+output_log="/srv/scalper/log/scalper.log"
+error_log="/srv/scalper/log/scalper.err"
+
+depend() {
+  need net local
+  after chronyd
+}
+
+start_pre() {
+  mountpoint -q /srv/scalper || return 1
+
+  i=0
+  while [ "$i" -lt 60 ]; do
+    year="$(date -u +%Y 2>/dev/null || echo 1970)"
+    [ "$year" -ge 2025 ] && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+
+  return 1
+}

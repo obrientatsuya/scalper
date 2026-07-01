@@ -1,0 +1,43 @@
+[app]
+mode = "capture"
+symbol = "BTCUSDT"
+
+[health]
+bind = "127.0.0.1:8787"
+
+[channels]
+market_events_capacity = 10000
+
+[heartbeat]
+interval = "1s"
+stale_after = "3s"
+
+[storage]
+enabled = true
+root_dir = "/srv/scalper/data/raw"
+flush_batch_size = 1000
+flush_interval = "1s"
+
+[[venues]]
+exchange = "binance"
+enabled = true
+market_data = true
+execution = false
+
+[[venues]]
+exchange = "mexc"
+enabled = false
+market_data = true
+execution = false
+
+[risk]
+starting_capital_brl = 100.0
+risk_per_trade_brl = 0.50
+max_daily_loss_brl = 2.0
+max_weekly_loss_brl = 5.0
+max_concurrent_positions = 1
+leverage_live_hard_cap_initial = 20.0
+leverage_paper_stress_cap = 500.0
+max_fee_to_target_ratio = 0.35
+max_slippage_to_stop_ratio = 0.20
+max_margin_fraction_per_trade = 0.02

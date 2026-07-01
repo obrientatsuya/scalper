@@ -1,237 +1,128 @@
 # Project Memory
 
-## 2026-06-24 Scalper Decisions
+Short repo-local handoff only. Full legacy detail lives in
+`docs/project-memory.legacy.md`; cross-session memory lives in `claude-mem`.
 
-- Build automated 30s BTCUSDT scalping research/execution system in Rust + Tokio.
-- No visual dependency: no Bookmap/MMT runtime, no screen scraping.
-- Bookmap/MMT are conceptual feature references only.
-- Pipeline must be data-driven: public API/feed, capture, replay, backtest.
-- Binance USD-M is base venue for market data and first orderbook.
-- MEXC Futures is candidate later after API, fees, risk, latency, and private stream validation.
-- 500x leverage is paper/stress-test only until proven. Live starts capped, initial hard cap 20x.
-- Leverage must be computed by risk engine from stop distance, fees, slippage, and liquidation buffer.
-- No live trading before replay, walk-forward, ablation, paper, and positive expectancy after costs.
+## Rules
 
-## Workflow Rules
+- Commit only when user explicitly asks.
+- Push only when user asks.
+- No live trading before replay, walk-forward, ablation, paper, and positive
+  expectancy after costs.
+- Keep active docs short; archive detail instead of duplicating it.
 
-- Only create commits when the user explicitly asks for a commit.
-- Before every commit, run the specific skill the user requests for that commit flow.
-- After that commit flow, push when requested.
-- Do not auto-commit just because implementation or tests are complete.
+## Current State
 
-Implemented:
+- Rust workspace with `scalper-core` and `scalper-app`.
+- Binance/MEXC market data, Binance options proxy, Parquet storage/replay,
+  orderbook, orderflow, profile/VWAP, GEX, hidden-liquidity, paper broker,
+  execution shell, historical imports, regime scan, and research runner exist.
+- Active roadmap/status: `docs/implementation-roadmap.md`.
+- Full system spec and sector definitions:
+  `docs/scalping-amt-gex-orderflow-spec.md#15-roadmap`.
 
-- Rust workspace.
-- `scalper-core` and `scalper-app`.
-- Config loader.
-- Runtime states.
-- Supervisor loop.
-- Health endpoint.
-- Binance combined WebSocket market data adapter: `aggTrade`, `bookTicker`, `depth@100ms`.
-- Binance local orderbook with REST snapshot and `U/u/pu` diff sequencing.
-- Orderbook stats in `/health`.
-- Raw Parquet storage:
-  - writes closed batch files like `events-000001.parquet`;
-  - schema: `ts_local_ms`, `ts_exchange_ms`, `exchange`, `symbol`, `event_kind`, `payload_json`;
-  - storage stats in `/health`.
-- Deterministic replay base:
-  - reads Parquet file or run directory;
-  - reconstructs `MarketEvent`;
-  - sorts by `ts_local_ms`;
-  - feeds the same app pipeline;
-  - disables live venue and storage in replay mode.
-- Full orderbook replay base:
-  - records Binance REST snapshots as `orderbook_snapshot` events;
-  - writes those snapshots into raw Parquet;
-  - replay feeds snapshots plus deltas into the orderbook engine;
-  - smoke replay reconstructed synced book with matching best bid/ask and update id.
-- Latency metrics:
-  - tracks `event_lag_ms` from exchange timestamp to local receive timestamp;
-  - tracks `ws_jitter_ms` from local inter-arrival variance;
-  - exposes raw/supervisor/orderflow/orderbook/storage queue depths in `/health`.
-- Orderflow/CVD base:
-  - signs aggressive trades from `aggTrade` side;
-  - tracks CVD notional plus buy/sell notional totals;
-  - computes delta windows for 250ms, 1s, 5s, 15s, and 60s;
-  - computes rolling delta z-score and price efficiency;
-  - publishes current 1s footprint bucket with bid/ask quantity by price bin in `/health`.
-- Heatmap/orderbook feature snapshots:
-  - maintains a lightweight book from recorded/live snapshots plus depth deltas;
-  - publishes best bid/ask, spread, microprice, and OBI 5/10/20 in `/health`;
-  - tracks level age, cumulative added/removed quantity, touches, survived touches, and vanish-before-touch;
-  - emits recent stack/pull events near top of book;
-  - scores bid/ask wall candidates with size z-score, persistence, touch survival, and vanish rate.
-- TPO/VP/VWAP base:
-  - maintains daily UTC profile from trades;
-  - counts TPO once per price bin per fixed interval;
-  - computes TPO POC plus 70% VAH/VAL;
-  - builds volume profile with VPOC, HVN, LVN, and previous-session nPOC touch status;
-  - publishes VWAP plus weighted sigma bands in `/health`.
-- GEX proxy base:
-  - adds normalized `OptionGreek` market events for replay/capture pipelines;
-  - computes per-strike/expiry `gex_1pct_usd` using configurable default dealer signs;
-  - publishes total GEX regime, gamma flip, max positive/negative GEX, gamma vacuum, and stale status in `/health`;
-  - uses spot from trades/tickers and marks GEX stale after the configured window.
-- Hidden-liquidity proxy base:
-  - detects iceberg/replenishment signals from trades versus displayed depth;
-  - detects spoof/pull when large displayed liquidity disappears without nearby trade;
-  - maps stop/liquidity pool candidates from repeated touches and round levels;
-  - publishes liquidation impulse, crowded positioning, and cross-exchange lead/lag proxies in `/health`.
-- Paper broker and risk engine base:
-  - maintains BRL/USDT ledger and paper positions;
-  - sizes orders from configured BRL risk and stop distance;
-  - enforces minQty/stepSize, fee/slippage gates, margin/leverage caps, and liquidation-before-stop rejection;
-  - simulates market fills, stop/target exits, fees, realized PnL, and daily kill switch;
-  - publishes initial paper ledger stats in `/health`.
-- Execution adapter base:
-  - defines normalized order request/report types;
-  - adds Binance Futures Demo adapter shell with generated/idempotent `clientOrderId`;
-  - validates order shape, reduce-only stops, cancel, and reconciliation state;
-  - publishes initial execution stats in `/health`.
-- MEXC Futures market-data adapter:
-  - connects to MEXC contract WebSocket `wss://contract.mexc.com/edge`;
-  - subscribes to `sub.deal`, `sub.ticker`, and `sub.depth`;
-  - normalizes trade, ticker, funding/mark/index, and depth events;
-  - maps app symbols like `BTCUSDT` to MEXC contract symbols like `BTC_USDT`.
-- Binance USD-M market-data adapter:
-  - routes high-frequency book feeds through `/public`;
-  - routes `aggTrade` through `/market`;
-  - captures live trade events again after endpoint split.
-- Strategy research base:
-  - generates long/short breakout and mean-reversion candidates from feature snapshots;
-  - labels candidates with 5s/15s/30s returns, 1R/2R hits, MAE/MFE, and target/stop timing;
-  - builds walk-forward splits;
-  - includes AMT/flow/GEX/heatmap ablation variants and threshold optimizer.
-- Production research runner:
-  - reads replay Parquet files, run directories, or nested multi-run directories;
-  - rebuilds profile/orderflow/heatmap feature snapshots without future leakage;
-  - generates candidates, labels outcomes, creates walk-forward splits, and optimizes thresholds;
-  - reports paper-validation summary with win rate, expectancy R, total R, and max drawdown R;
-  - reports walk-forward out-of-sample validation by training threshold on each train slice and testing on the next slice;
-  - classifies each walk-forward test split by trend regime (`uptrend`, `downtrend`, `range`) and volatility regime (`low`, `normal`, `high`);
-  - computes split regime from full `price_samples` inside the test interval instead of sparse candidate entry prices;
-  - aggregates out-of-sample result by regime with splits, trades, expectancy R, total R, and positive split rate;
-  - caps 5s/15s/30s horizon labels to nearby samples so large capture gaps do not create false returns;
-  - CLI: `scalper research --input <path> [--output report.json]`.
-- Historical Binance kline import:
-  - adds `scalper import-klines` for Binance USD-M `/fapi/v1/klines`;
-  - writes imported candles as explicit `kline` market events to replay-ready Parquet;
-  - supports `--symbol`, `--interval`, `--start-time-ms`, `--end-time-ms`, `--lookback-hours`, `--output-root`, and `--run-name`;
-  - research uses `kline` close prices as historical price samples but does not count them as live trade events;
-  - 2026-06-28 smoke imported 1,440 BTCUSDT 1m candles to `data/historical/binance-klines/btcusdt/btcusdt-1m-24h-smoke`;
-  - smoke report `data/reports/research-klines-24h-smoke.json` confirmed 1,440 `kline` events, 0 trades, and 1,440 price samples.
-- Historical Binance aggregate-trade import:
-  - adds `scalper import-aggtrades` for Binance USD-M `/fapi/v1/aggTrades`;
-  - writes imported aggregate trades as normal `TradeEvent` records to replay-ready Parquet;
-  - supports `--symbol`, `--start-time-ms`, `--end-time-ms`, `--output-root`, `--run-name`, and `--flush-batch-size`;
-  - includes basic 429 backoff during pagination;
-  - imported a 5m high-volatility target window to `data/historical/binance-aggtrades/btcusdt/btcusdt-uptrend-high-5m-smoke` with 119,643 aggregate trades;
-  - imported a smaller 20s smoke window to `data/historical/binance-aggtrades/btcusdt/btcusdt-uptrend-high-20s-smoke` with 4,659 aggregate trades;
-  - generated smoke research report `data/reports/research-aggtrades-uptrend-high-20s.json`, confirming 4,659 trade events and 11 candidates;
-  - large high-frequency aggTrade research still needs orderflow/research-runner optimization before full 5m OOS can complete comfortably.
-- Historical regime scanner:
-  - adds `scalper regime-scan --input <parquet-path> [--output report.json]`;
-  - scans `trade`, `ticker`, and `kline` price samples with configurable `--window-size` and `--step-size`;
-  - reports observed trend/volatility regimes plus per-regime window counts, average return, and realized volatility;
-  - 24h kline scan `data/reports/regime-scan-klines-24h-smoke.json` found `uptrend`, `downtrend`, and `range`, but only `low` volatility;
-  - 30d kline scan with 4h windows `data/reports/regime-scan-klines-30d.json` found `uptrend`, `downtrend`, `range`, `low`, and `normal`; `high` volatility was not present at that window size;
-  - 30d kline scan with 30m windows `data/reports/regime-scan-klines-30d-w30.json` found all trend regimes and all volatility regimes, including 2 `uptrend`/`high` windows.
-- Binance signed execution REST/user-stream base:
-  - signs USD-M Futures REST queries with HMAC-SHA256;
-  - supports signed new order/cancel order calls for `/fapi/v1/order`;
-  - manages user-stream listenKey start/keepalive/close calls;
-  - parses `ORDER_TRADE_UPDATE` user-stream messages into execution reports.
-- Binance Options chain adapter:
-  - fetches EAPI mark prices and open interest;
-  - parses option symbol into underlying, expiry, strike, and call/put type;
-  - normalizes marks/open interest into `OptionGreekEvent` records for GEX;
-  - provides polling helper to feed option greeks into the market-event pipeline.
-- Research validation smoke:
-  - captured live BTCUSDT Parquet run at `data/raw/2026-06-27/btcusdt/run-202913`;
-  - wrote report to `data/reports/research-run-2026-06-27.json`;
-  - processed 5,926 events: 5,504 tickers, 421 depth deltas, 1 orderbook snapshot, 0 trades;
-  - ticker fallback produced 5,504 price samples, 288 candidates, and 288 labels;
-  - paper-validation smoke: 122 trades, 80.33% win rate, 0.0873R expectancy, 10.65R total, 1.70R max drawdown.
-- Trade-enabled research smoke:
-  - captured live BTCUSDT Parquet run at `data/raw/2026-06-27/btcusdt/run-204643`;
-  - wrote report to `data/reports/research-run-2026-06-27-trades.json`;
-  - processed 8,325 events: 302 trades, 7,308 tickers, 714 depth deltas, 1 orderbook snapshot;
-  - produced 7,610 price samples, 386 candidates, and 386 labels;
-  - paper-validation smoke: threshold 3.0, 17 trades, 82.35% win rate, 0.1121R expectancy, 1.91R total, 0.51R max drawdown;
-  - data quality is insufficient because trade events < 500, paper trades < 100, and walk-forward splits < 1.
-- Long trade-enabled research validation:
-  - captured live BTCUSDT Parquet run at `data/raw/2026-06-27/btcusdt/run-205242`;
-  - wrote aggregate report to `data/reports/research-run-2026-06-27-aggregate.json`;
-  - processed 46,111 events: 1,270 trades, 39,913 tickers, 4,925 depth deltas, 3 orderbook snapshots;
-  - produced 41,183 price samples, 2,216 labels, and 17 walk-forward splits;
-  - default data quality passed: 1,270 trades, 101 in-sample paper trades, 17 splits;
-  - in-sample threshold result: threshold 3.0, 101 trades, 0.0603R expectancy;
-  - walk-forward out-of-sample result: 16 evaluated splits, 81 trades, 76.54% win rate, 0.0633R expectancy, 5.13R total;
-  - split robustness result: 15/16 evaluated splits positive, 93.75% positive split rate;
-  - regime classification result: all 16 evaluated splits currently classify as `range`/`low`, with 81 trades, 0.0633R expectancy, and 93.75% positive split rate.
-- Additional 2026-06-28 regime capture:
-  - captured live BTCUSDT Parquet run at `data/raw/2026-06-28/btcusdt/run-153220`;
-  - wrote report to `data/reports/research-run-2026-06-28-live.json`;
-  - processed 143,008 events, including 6,872 trades and 11,037 labels;
-  - report still failed regime coverage: only `range`/`low` appeared, with 102 splits, 3,906 OOS trades, and 0.0827R expectancy.
-- Multi-day aggregate research validation:
-  - wrote report to `data/reports/research-run-all-aggregate.json`;
-  - processed 189,119 events, including 8,142 trades and 13,267 labels;
-  - observed trend regimes improved to `downtrend` and `range`, but volatility coverage remains `low` only after price-sample-based regime classification;
-  - current `data_quality.issues`: `trend_regimes 2 below min 3`; `volatility_regimes 1 below min 3`;
-  - regime results: `downtrend`/`low` has 1 split, 4 OOS trades, 0.1244R expectancy; `range`/`low` has 122 splits, 3,952 OOS trades, 0.1030R expectancy, and 70% positive split rate.
-- Research data-quality gate:
-  - report includes `data_quality.sufficient`;
-  - default minimums are 500 trade events, 100 in-sample paper trades, 1 walk-forward split, 50 out-of-sample trades, non-negative out-of-sample expectancy, 60% positive out-of-sample split rate, 3 observed trend regimes, and 3 observed volatility regimes;
-  - latest multi-day aggregate report passes performance gates but currently fails coverage gates: observed trend regimes = `downtrend`, `range`; observed volatility regimes = `low`;
-  - current `data_quality.issues`: `trend_regimes 2 below min 3`; `volatility_regimes 1 below min 3`;
-  - CLI exposes `--min-trade-events`, `--min-paper-trades`, `--min-walk-forward-splits`, `--min-oos-trades`, `--min-oos-expectancy-r`, `--min-positive-oos-split-rate`, `--min-trend-regimes`, and `--min-volatility-regimes`.
+## Current Research Read
 
-Verified:
+- Early smoke result `0.0873R` was ticker-fallback and fragile.
+- Trade-enabled aggregate OOS result `0.0633R` is stricter and more useful.
+- Latest larger reports show positive OOS expectancy but still weak regime
+  coverage.
+- Next research goal: fewer trades, more aggressive-flow confirmation, stronger
+  OOS validation by regime.
+- Research performance improved by deferring orderflow/profile/rolling feature
+  stats to emitted snapshots and caching `ProfileTracker` totals/POCs/variance;
+  5m high-frequency aggregate smoke now completes in about 2.4s locally.
+- Research report includes aggression metrics. Default threshold search now uses
+  aggressive grid `[4.0, 5.0]` and picks a threshold that satisfies
+  `min-paper-trades` when possible.
+- Current 5m aggressive smoke: 119,643 trades -> 85 candidates -> 9 selected
+  at threshold 3.0; in-sample looks strong, but OOS remains unproven due small
+  selected sample.
+- Added grouped chunked aggregate-trade import via `--chunk-ms`; chunks are
+  stored under one parent run and research reads the parent recursively.
+- Added `import-regime-aggtrades` to import aggTrade windows directly from a
+  `regime-scan` JSON report by trend/volatility filters. It supports
+  `--skip-windows` so follow-up imports do not duplicate prior matches.
+- High-vol aggregate aggressive report:
+  `data/reports/research-aggtrades-high-vol-aggregate-aggressive.json`.
+  It processed 718,512 aggTrade events, found 347 candidates and 47 selected
+  candidates, then reported 13 OOS trades at 3.2178R expectancy across 3
+  evaluated splits with 66.7% positive split rate. Treat as promising, not
+  complete, because regime coverage remains narrow.
+- High-frequency regime classification now uses 1-minute bucket closes plus
+  30-minute context around walk-forward test splits, so aggTrade reports do not
+  get mislabeled as low-volatility from tiny per-trade returns.
+- Research now splits historical streams on gaps over 5 minutes; orderflow,
+  profile, heatmap, rolling features, labels, and market-regime coverage no
+  longer bridge separate imported windows.
+- Added longer 30m downtrend/normal, range/normal, and uptrend/normal aggTrade
+  imports through skip-window batches (`w30-2`, `w30-2b`, `w30-2c`).
+- Short breakout candidates now require selling book imbalance
+  (`obi_20 <= -0.35`). AggTrade-only short breakouts were negative OOS, while
+  long breakouts carried the current edge.
+- Expanded aggressive default-gate report:
+  `data/reports/research-aggtrades-regime-expanded-aggressive-default-gates.json`.
+  It processes 2,529,534 aggTrade events with full trend/volatility coverage,
+  1,944 candidates, threshold 4.0, 108 paper trades at 0.7878R, 61 OOS trades
+  at 1.1389R, 64.7% positive evaluated splits, and
+  `data_quality.sufficient = true`.
+- Research snapshots now carry GEX regime, total 1% GEX USD, and gamma-flip
+  distance when option greeks are present. GEX variants adjust candidate scores
+  from those fields; missing/stale GEX leaves candidates unchanged.
+- `import-option-greeks` fetches Binance Options greeks snapshots into Parquet
+  and supports `--ts-local-ms` for aligned replay smoke. Smoke
+  `option-greeks-btc-smoke` stored 572 BTC option-greek events at
+  `1780365659999`; research replay read all 572 as `option_greeks`.
+- `combine-parquet` merges multiple Parquet runs into one sorted replay run.
+  Controlled GEX smoke `gex-oi-repeated-smoke-up-normal-w30-window0` combines
+  98,030 aggTrades with 17,160 repeated BTC option-greek events using open
+  interest for expiration `260925`.
+- `research-gex-oi-repeated-combined-smoke.json` verifies GEX features are
+  non-empty: 93/93 candidates and 13/13 selected candidates carry GEX, avg
+  selected GEX is `-2,499,628` 1% USD, and GEX ablation diverges from flow-only
+  (27 vs 24 selected; 13 vs 12 OOS trades). Treat as plumbing smoke, not
+  historical GEX edge, because the option snapshot is repeated over the window.
+- Report includes ablations. `amt_flow`/`amt_flow_gex` are still identical on
+  the current aggTrade-heavy dataset because it has no option-greek events: 254
+  selected, 173 OOS trades, 0.1145R, 45.5% positive splits. Full
+  `amt_flow_gex_heatmap` keeps 108 selected, 61 OOS trades, 1.1389R, 64.7%
+  positive splits. Heatmap/book confirmation currently carries real filter
+  value; GEX needs historical option greek replay for measurement.
 
-- `cargo fmt`
-- `cargo check`
-- `cargo test`
-- `cargo build -p scalper-app`
-- Real Binance smoke for market data and orderbook.
-- Capture smoke wrote valid Parquet batch files.
-- Replay smoke processed captured events from Parquet.
-- Replay smoke rebuilt orderbook from captured snapshot + depth deltas.
-- Latency unit tests for event lag, WebSocket jitter, and queue depths.
-- Orderflow unit tests for CVD signing, rolling windows, price efficiency, and footprint buckets.
-- Heatmap unit tests for OBI/microprice, stack/pull detection, and wall candidate selection.
-- Profile unit tests for VWAP bands, TPO counting, value area, VP nodes, and nPOC carry/touch.
-- GEX unit tests for per-option formula, regime, gamma flip, and stale detection.
-- Hidden-liquidity unit tests for iceberg, spoof/pull, liquidation/crowding, and lead/lag.
-- Paper/risk unit tests for sizing, minQty rejection, ledger close, and daily kill switch.
-- Execution unit tests for generated ids, duplicate rejection, reduce-only stop/cancel, and reconcile.
-- MEXC parser unit tests for symbol mapping, deal, ticker, and depth messages.
-- Research unit tests for candidate generation, labels, walk-forward splits, and threshold optimization.
-- Research runner unit test for replay-style event processing without lookahead.
-- Binance signed execution tests for query signing and user-stream order update parsing.
-- Binance Options adapter tests for symbol parsing, mark/open-interest normalization, and mark payload parsing.
-- Research runner paper-validation unit test for win rate, total R, and max drawdown.
-- Live Parquet research smoke generated `data/reports/research-run-2026-06-27.json`.
-- Trade-enabled Parquet research smoke generated `data/reports/research-run-2026-06-27-trades.json`.
-- Research data-quality gate unit test for insufficient samples.
-- Aggregate Parquet research validation generated `data/reports/research-run-2026-06-27-aggregate.json` and passed default data-quality gate.
-- Research runner unit tests for recursive nested Parquet reads, gap-safe horizon labels, and walk-forward out-of-sample validation.
-- Research data-quality unit tests for required out-of-sample trades and positive out-of-sample expectancy.
-- Research data-quality unit test for minimum positive out-of-sample split rate.
-- Research runner unit test for walk-forward regime classification from split prices.
-- Research data-quality unit test for trend/volatility regime coverage.
-- Additional 2026-06-28 Parquet capture generated `data/reports/research-run-2026-06-28-live.json`.
-- Multi-day aggregate research report generated `data/reports/research-run-all-aggregate.json`.
-- Historical kline import smoke generated `data/reports/research-klines-24h-smoke.json`.
-- Historical aggregate-trade import smoke generated `data/reports/research-aggtrades-uptrend-high-20s.json`.
-- Storage unit test for writing named Parquet runs.
-- Research runner unit test for `kline` historical price samples without trade-count inflation.
-- Historical aggregate-trade conversion unit test.
-- Historical regime-scan reports generated `data/reports/regime-scan-klines-24h-smoke.json` and `data/reports/regime-scan-klines-30d.json`.
-- Historical 30d 30m regime-scan report generated `data/reports/regime-scan-klines-30d-w30.json`.
-- Research runner unit test for scanning regime windows from `kline` events.
+## Next
 
-Next:
+1. Capture or import real time-aligned option-greek history for GEX ablation.
+2. Add cost/slippage/liquidation assumptions before paper broker validation.
+3. Profile remaining research cost: Parquet read, candidate scoring, and
+   walk-forward threshold scans.
 
-1. Use the 30d 30m `regime-scan` high-volatility windows to target/import more granular data, then validate strategy OOS on those windows with trade-level data when available.
-2. Iterate thresholds/filters after out-of-sample evidence remains positive across regimes.
+## Deployment Target
+
+- Production target is an old notebook running headless Alpine Linux diskless
+  from a bootable USB stick, 24/7.
+- Final scalper refactor should prioritize energy efficiency, low RAM pressure,
+  security, and stable long-running operation on that low-power server.
+- Avoid frequent USB writes. The boot USB should mostly hold OS overlay,
+  binaries, config, and emergency local state. Runtime heartbeat/status should
+  live in RAM when local, and durable data should move to cloud storage/database.
+- Durable scalper data should live in Supabase/cloud instead of relying on local
+  USB writes. Local Parquet capture on the USB-backed ext4 image is temporary
+  until cloud storage is implemented.
+- Observability target:
+  - Server writes compact heartbeat/status every 2 minutes.
+  - Heartbeat includes server stats: online timestamp, uptime, load, RAM, disk,
+    CPU temperature, service status.
+  - Heartbeat includes scalper stats: health state, market events, queue depth,
+    latency, orderbook sync, storage errors, paper/live PnL, open positions,
+    kill switch, and other critical runtime fields.
+  - Supabase stores current status with upsert semantics, not unbounded
+    heartbeat history.
+  - Supabase observes heartbeat age/state changes and calls Telegram API only
+    on meaningful transitions: server down, server recovered, scalper down,
+    scalper recovered, PnL/risk alert, disk/RAM/temp critical, no market events,
+    storage errors, or kill switch.
+  - Do not send periodic Telegram spam. Telegram is for state changes and
+    critical alerts; status dashboard reads Supabase.
+- During normal feature development, do not over-optimize for this deployment
+  target yet. Preserve the goal and do the final efficiency/storage refactor
+  near production hardening.

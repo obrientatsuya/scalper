@@ -1,0 +1,5 @@
+ops/alpine/** text eol=lf
+supabase/functions/**/*.ts text eol=lf
+supabase/sql/**/*.sql text eol=lf
+supabase/migrations/**/*.sql text eol=lf
+*.sh text eol=lf

@@ -1,0 +1,128 @@
+#!/bin/sh
+set -eu
+
+OUT_DIR=/run/scalper/status
+OUT="$OUT_DIR/latest.json"
+TMP="$OUT.tmp"
+mkdir -p "$OUT_DIR"
+
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+host="$(hostname)"
+uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+load1="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)"
+load5="$(awk '{print $2}' /proc/loadavg 2>/dev/null || echo 0)"
+load15="$(awk '{print $3}' /proc/loadavg 2>/dev/null || echo 0)"
+
+mem_total_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+mem_avail_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+mem_used_kb="$((mem_total_kb - mem_avail_kb))"
+mem_total_mb="$((mem_total_kb / 1024))"
+mem_used_mb="$((mem_used_kb / 1024))"
+mem_used_percent=0
+[ "$mem_total_kb" -gt 0 ] && mem_used_percent="$((mem_used_kb * 100 / mem_total_kb))"
+
+disk_usb_pct="$(df -P /media/usb 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}' || echo null)"
+disk_scalper_pct="$(df -P /srv/scalper 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}' || echo null)"
+disk_scalper_free_mb="$(df -Pm /srv/scalper 2>/dev/null | awk 'NR==2 {print $4}' || echo null)"
+
+temp_c="null"
+for z in /sys/class/thermal/thermal_zone*/temp; do
+  [ -r "$z" ] || continue
+  raw="$(cat "$z" 2>/dev/null || echo '')"
+  case "$raw" in
+    ''|*[!0-9]*) continue ;;
+    *) temp_c="$(awk "BEGIN { printf \"%.1f\", $raw / 1000 }")"; break ;;
+  esac
+done
+
+scalper_service="stopped"
+rc-service scalper status >/dev/null 2>&1 && scalper_service="started"
+
+health_file="$(mktemp)"
+if curl -fsS --max-time 3 http://127.0.0.1:8787/health > "$health_file" 2>/dev/null; then
+  scalper_http="ok"
+  scalper_summary="$(jq -c '{
+    state,
+    allows_signals,
+    uptime_seconds,
+    market_events_seen,
+    latency: {
+      event_lag_ms_last: .latency.event_lag_ms_last,
+      event_lag_ms_avg: .latency.event_lag_ms_avg,
+      ws_jitter_ms_avg: .latency.ws_jitter_ms_avg,
+      queue_depths: .latency.queue_depths
+    },
+    storage: {
+      enabled: .storage.enabled,
+      current_file: .storage.current_file,
+      records_written: .storage.records_written,
+      flush_errors: .storage.flush_errors
+    },
+    orderbook: {
+      synced: .orderbook.synced,
+      best_bid: .orderbook.best_bid,
+      best_ask: .orderbook.best_ask,
+      gaps: .orderbook.gaps,
+      resyncs: .orderbook.resyncs
+    },
+    paper: .paper
+  }' "$health_file")"
+else
+  scalper_http="down"
+  scalper_summary="null"
+fi
+rm -f "$health_file"
+
+jq -cn \
+  --arg id "scalper-alpine" \
+  --arg updated_at "$now" \
+  --arg host "$host" \
+  --arg load1 "$load1" \
+  --arg load5 "$load5" \
+  --arg load15 "$load15" \
+  --arg scalper_service "$scalper_service" \
+  --arg scalper_http "$scalper_http" \
+  --argjson uptime_seconds "$uptime_s" \
+  --argjson mem_total_mb "$mem_total_mb" \
+  --argjson mem_used_mb "$mem_used_mb" \
+  --argjson mem_used_percent "$mem_used_percent" \
+  --argjson disk_usb_used_percent "$disk_usb_pct" \
+  --argjson disk_scalper_used_percent "$disk_scalper_pct" \
+  --argjson disk_scalper_free_mb "$disk_scalper_free_mb" \
+  --argjson temp_c "$temp_c" \
+  --argjson scalper "$scalper_summary" \
+  '{
+    id: $id,
+    updated_at: $updated_at,
+    host: $host,
+    server: {
+      uptime_seconds: $uptime_seconds,
+      load_average: { one: ($load1|tonumber), five: ($load5|tonumber), fifteen: ($load15|tonumber) },
+      memory: { total_mb: $mem_total_mb, used_mb: $mem_used_mb, used_percent: $mem_used_percent },
+      disk: { usb_used_percent: $disk_usb_used_percent, scalper_used_percent: $disk_scalper_used_percent, scalper_free_mb: $disk_scalper_free_mb },
+      cpu: { temp_c: $temp_c }
+    },
+    scalper: {
+      service: $scalper_service,
+      http: $scalper_http,
+      health: $scalper
+    }
+  }' > "$TMP"
+mv "$TMP" "$OUT"
+
+if [ -f /etc/scalper/heartbeat.env ]; then
+  . /etc/scalper/heartbeat.env
+fi
+
+if [ "${SUPABASE_URL:-}" ] && [ "${SUPABASE_ANON_KEY:-}" ] && [ "${HEARTBEAT_INGEST_TOKEN:-}" ]; then
+  heartbeat_id="${HEARTBEAT_ID:-scalper-alpine}"
+  body="$(jq -cn --arg id "$heartbeat_id" --arg token "$HEARTBEAT_INGEST_TOKEN" --slurpfile payload "$OUT" \
+    '{p_id:$id, p_payload:$payload[0], p_token:$token}')"
+  curl -fsS --max-time 10 \
+    -X POST "$SUPABASE_URL/rest/v1/rpc/submit_server_heartbeat" \
+    -H "apikey: $SUPABASE_ANON_KEY" \
+    -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    >/dev/null || true
+fi

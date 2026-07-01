@@ -1,6 +1,9 @@
 /target/
 /data/
 *.log
+.env
+.env.*
+supabase/functions/.env*
 .agents/
 AGENTS.md
 skills-lock.json

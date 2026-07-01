@@ -1,0 +1,5 @@
+#!/bin/sh
+mount -o remount,rw /media/usb || true
+mkdir -p /srv/scalper
+mountpoint -q /srv/scalper || mount -o loop,rw /media/usb/scalper.ext4 /srv/scalper
+chown -R codex:codex /srv/scalper

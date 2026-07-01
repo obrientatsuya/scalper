@@ -1,0 +1,3 @@
+SHELL=/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
+*/2 * * * * /usr/local/bin/scalper-heartbeat >/run/scalper/heartbeat.log 2>&1

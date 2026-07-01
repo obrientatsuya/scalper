@@ -1,0 +1,4 @@
+project_id = "scalper"
+
+[functions.monitor-heartbeat]
+verify_jwt = true
